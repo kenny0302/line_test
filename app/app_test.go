@@ -36,6 +36,12 @@ func createTestConfig() {
  host: localhost
  port: 27017
 
+redis:
+ host: localhost
+ port: 6379
+ password: ""
+ db: 0
+
 line:
  secret: test_secret
  token: test_token

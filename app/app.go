@@ -1,11 +1,13 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"io/ioutil"
 	"log"
-	db "main/db"
-	proto "main/proto"
+	"main/db"
+	"main/lock"
+	"main/proto"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,9 +15,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/line/line-bot-sdk-go/v7/linebot"
+	"github.com/redis/go-redis/v9"
 	"github.com/spf13/viper"
 	"go.mongodb.org/mongo-driver/bson"
 )
+
+var redisClient *redis.Client
 
 func SetupRouter() *gin.Engine {
 	router := gin.Default()
@@ -27,6 +32,15 @@ func SetupRouter() *gin.Engine {
 	if err != nil {
 		panic("Can Not Read File：" + err.Error())
 	}
+
+	// Initialize Redis client
+	redisClient = lock.NewRedisClient(lock.Config{
+		Host:     viper.GetString("redis.host"),
+		Port:     viper.GetString("redis.port"),
+		Password: viper.GetString("redis.password"),
+		DB:       viper.GetInt("redis.db"),
+	})
+
 	router.POST("/callback", GetBotData)
 	router.GET("/list", ListUser)
 	router.POST("/push", PushMessage)
@@ -97,26 +111,39 @@ func GetBotData(c *gin.Context) {
 }
 
 func Set(host, port string, data []byte) error {
-
 	var Newdata proto.User
 	json.Unmarshal(data, &Newdata)
 
-	out, err := db.GetUser(host, port, "line", "user", bson.D{{"userid", Newdata.UserId}})
-	if err != nil {
-		return err
-	}
-	if len(out) <= 0 {
-		err = db.SetUser(host, port, "line", "user", bson.M{"userid": Newdata.UserId, "displayname": Newdata.DisplayName, "pictureurl": Newdata.PictureUrl})
+	// Use distributed lock to prevent race conditions
+	ctx := context.Background()
+	lockKey := "user:" + Newdata.UserId
+
+	// Use WithLockRetry to handle lock acquisition with retries
+	err := lock.WithLockRetry(ctx, redisClient, lockKey, 10*time.Second, 3, 100*time.Millisecond, func() error {
+		// Critical section: check and insert user data
+		out, err := db.GetUser(host, port, "line", "user", bson.D{{"userid", Newdata.UserId}})
 		if err != nil {
 			return err
 		}
-	}
-	time := time.Now().Unix()
-	err = db.SetMessage(host, port, "line", "message", bson.M{"userid": Newdata.UserId, "message": Newdata.Message, "time": strconv.FormatInt(time, 10)})
-	if err != nil {
-		return err
-	}
-	return nil
+
+		if len(out) <= 0 {
+			err = db.SetUser(host, port, "line", "user", bson.M{"userid": Newdata.UserId, "displayname": Newdata.DisplayName, "pictureurl": Newdata.PictureUrl})
+			if err != nil {
+				return err
+			}
+		}
+
+		// Insert message
+		timestamp := time.Now().Unix()
+		err = db.SetMessage(host, port, "line", "message", bson.M{"userid": Newdata.UserId, "message": Newdata.Message, "time": strconv.FormatInt(timestamp, 10)})
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	return err
 }
 
 func ListUser(c *gin.Context) {
